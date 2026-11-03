@@ -1,8 +1,10 @@
-name: Automated BDIX Index & ML Vector Compiler
+name: "Sync BDIX Index"
 
 on:
+  push:
+    branches:
+      - main
   schedule:
-    # Run every 6 hours automatically (UTC)
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
@@ -27,18 +29,8 @@ jobs:
           echo "[Setup] Starting Mihomo daemon with BDIX proxies on port 7890..."
           ./mihomo -d . -f config.yaml > mihomo.log 2>&1 &
           
-          # Wait up to 10s for proxy to listen
-          for i in {1..10}; do
-            if nc -z 127.0.0.1 7890 2>/dev/null; then
-              echo "[Setup] Mihomo proxy listening on 127.0.0.1:7890!"
-              break
-            fi
-            sleep 1
-          done
-          
-          # Verify connection through proxy to CircleFTP
-          echo "[Setup] Testing connectivity to CircleFTP..."
-          curl -sI --max-time 10 -x http://127.0.0.1:7890 http://new.circleftp.net:5000/api/categories || echo "Initial probe warning, continuing..."
+          sleep 4
+          cat mihomo.log || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -63,16 +55,10 @@ jobs:
           cat dist/manifest.json
 
       - name: Publish to GitHub Releases (Tag: latest)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: "CircleFTP Index & Embeddings (Automated Sync)"
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            dist/circleftp.db.zst
-            dist/circleftp.db.sha256
-            dist/manifest.json
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create latest dist/* \
+            --title "CircleFTP Index & Embeddings (Automated Sync)" \
+            --notes "Automated daily sync of CircleFTP media database and 64-dim ML embeddings." \
+            --clobber

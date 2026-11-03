@@ -316,6 +316,7 @@ def compile_sqlite_database(
         created_str = item.get("createdAt")
         if created_str:
             try:
+                # Approximate parse
                 created_epoch = int(time.mktime(time.strptime(created_str[:10], "%Y-%m-%d")))
             except Exception:
                 pass
@@ -365,26 +366,33 @@ def compile_sqlite_database(
     print(f"[Database] SQLite database successfully built: {db_size / (1024*1024):.2f} MB")
 
 
-def compress_database(db_path: str) -> str:
-    """Compresses SQLite database to .zst using zstandard."""
+def compress_database(db_path: str) -> List[str]:
+    compressed_files = []
+    
     zst_path = f"{db_path}.zst"
     print(f"\n[Compressor] Compressing {db_path} -> {zst_path}...")
     try:
         import zstandard as zstd
-
         cctx = zstd.ZstdCompressor(level=19)
         with open(db_path, "rb") as ifh, open(zst_path, "wb") as ofh:
             cctx.copy_stream(ifh, ofh)
-    except ImportError:
-        import gzip
-        zst_path = f"{db_path}.gz"
-        print(f"[Compressor] zstandard not found, falling back to gzip: {zst_path}...")
-        with open(db_path, "rb") as f_in, gzip.open(zst_path, "wb") as f_out:
-            f_out.writelines(f_in)
+        compressed_files.append(zst_path)
+        print(f"[Compressor] Created {os.path.basename(zst_path)}: {os.path.getsize(zst_path) / (1024*1024):.2f} MB")
+    except Exception as e:
+        print(f"[Compressor] Zstandard compression warning: {e}")
 
-    zst_size = os.path.getsize(zst_path)
-    print(f"[Compressor] Compressed package created: {zst_size / (1024*1024):.2f} MB")
-    return zst_path
+    gz_path = f"{db_path}.gz"
+    print(f"\n[Compressor] Compressing {db_path} -> {gz_path}...")
+    try:
+        import gzip
+        with open(db_path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=9) as f_out:
+            f_out.writelines(f_in)
+        compressed_files.append(gz_path)
+        print(f"[Compressor] Created {os.path.basename(gz_path)}: {os.path.getsize(gz_path) / (1024*1024):.2f} MB")
+    except Exception as e:
+        print(f"[Compressor] Gzip compression warning: {e}")
+
+    return compressed_files
 
 
 def compute_sha256(file_path: str) -> str:
@@ -460,15 +468,24 @@ def main():
     compile_sqlite_database(db_path, categories, all_items, embeddings)
 
     # 4. Compression & Digest
-    compressed_path = compress_database(db_path)
-    sha256 = compute_sha256(compressed_path)
+    compressed_paths = compress_database(db_path)
+    primary_compressed = compressed_paths[0] if compressed_paths else db_path
+    primary_sha256 = compute_sha256(primary_compressed)
+
+    for cp in compressed_paths:
+        compute_sha256(cp)
+    compute_sha256(db_path)
+
+    default_sha_file = os.path.join(args.outdir, "circleftp.db.sha256")
+    with open(default_sha_file, "w") as f:
+        f.write(f"{primary_sha256}  circleftp.db.zst\n")
 
     # 5. Manifest
-    comp_filename = os.path.basename(compressed_path)
+    comp_filename = os.path.basename(primary_compressed)
     generate_manifest(
         output_dir=args.outdir,
         db_filename=comp_filename,
-        sha256=sha256,
+        sha256=primary_sha256,
         total_items=len(all_items),
         download_url=f"{args.release_url_prefix}/{comp_filename}",
     )
