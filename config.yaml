@@ -1,0 +1,176 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:9090
+
+proxies:
+  - name: Node - 1
+    password: FuCk_u
+    port: 11911
+    server: 175.29.161.201
+    type: socks5
+    username: SiX
+  - name: Node - 2
+    password: fUcK_u
+    port: 11911
+    server: 202.4.116.117
+    type: socks5
+    username: SiX
+  - name: Node - 3
+    password: FuCK_U
+    port: 11911
+    server: 202.4.116.141
+    type: socks5
+    username: SiX
+  - name: Node - 4
+    password: FuCK_U
+    port: 11911
+    server: 202.4.122.122
+    type: socks5
+    username: SiX
+  - name: Node - 5
+    password: "11911"
+    port: 11911
+    server: 103.142.69.155
+    type: socks5
+    username: "11911"
+  - name: Node - 7
+    port: 11911
+    server: 116.212.104.202
+    type: socks5
+  - name: Node - 8
+    port: 11911
+    server: 103.244.49.181
+    type: socks5
+  - name: Node - 9
+    port: 11911
+    server: 103.154.49.165
+    type: socks5
+  - name: Node - 11
+    port: 11911
+    server: 103.186.238.118
+    type: socks5
+  - name: Node - 12
+    password: e
+    port: 11811
+    server: 103.69.151.250
+    type: socks5
+    username: e
+  - name: Node - 13
+    password: R!@zuL
+    port: 4742
+    server: 180.149.235.157
+    type: socks5
+    username: R!@zuL
+  - name: Node - 14
+    password: e
+    port: 4742
+    server: 180.149.235.17
+    type: socks5
+    username: e
+  - name: Node - 19
+    password: R!@zuL
+    port: 4742
+    server: 103.69.151.194
+    type: socks5
+    username: R!@zuL
+  - name: Node - 20
+    password: e
+    port: 4742
+    server: 103.69.150.233
+    type: socks5
+    username: e
+  - name: Node - 21
+    password: R!@zuL
+    port: 4742
+    server: 180.149.235.153
+    type: socks5
+    username: R!@zuL
+  - name: Node - 22
+    port: 33311
+    server: 103.115.242.97
+    type: socks5
+  - name: Node - 23
+    password: "1"
+    port: 9922
+    server: 103.42.203.50
+    type: socks5
+    username: "1"
+
+proxy-groups:
+  - name: Experiment Cats
+    icon: https://six6.me/uploads/site/favicon.png?v=1781171652
+    type: select
+    url: http://1.1.1.1
+    proxies:
+      - FULL BDIX
+      - BDIX & INT
+  - name: BDIX & INT
+    type: load-balance
+    hidden: true
+    strategy: round-robin
+    url: http://1.1.1.1
+    proxies:
+      - DIRECT
+      - FULL BDIX
+  - name: FULL BDIX
+    type: load-balance
+    hidden: true
+    strategy: round-robin
+    url: http://1.1.1.1
+    proxies:
+      - Node - 1
+      - Node - 2
+      - Node - 3
+      - Node - 4
+      - Node - 5
+      - Node - 7
+      - Node - 8
+      - Node - 9
+      - Node - 11
+      - Node - 12
+      - Node - 13
+      - Node - 14
+      - Node - 19
+      - Node - 20
+      - Node - 21
+      - Node - 22
+      - Node - 23
+  - name: CircleFTP
+    type: load-balance
+    strategy: round-robin
+    url: http://1.1.1.1
+    hidden: true
+    proxies:
+      - Node - 8
+      - Node - 11
+  - name: DhakaFlix
+    type: load-balance
+    strategy: round-robin
+    url: http://1.1.1.1
+    hidden: true
+    proxies:
+      - Node - 1
+      - Node - 5
+  - name: CLOUD TV
+    type: load-balance
+    strategy: round-robin
+    url: http://1.1.1.1
+    hidden: true
+    proxies:
+      - Node - 1
+  - name: CLUBBD
+    type: load-balance
+    strategy: round-robin
+    url: http://1.1.1.1
+    hidden: true
+    proxies:
+      - Node - 2
+      - Node - 3
+      - Node - 4
+
+rules:
+  - DOMAIN-SUFFIX,circleftp.net,CircleFTP
+  - MATCH,DIRECT

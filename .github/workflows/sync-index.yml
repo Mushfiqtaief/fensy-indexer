@@ -1,0 +1,78 @@
+name: Automated BDIX Index & ML Vector Compiler
+
+on:
+  schedule:
+    # Run every 6 hours automatically (UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy-index:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Mihomo BDIX Proxy Core
+        run: |
+          echo "[Setup] Downloading Mihomo Linux x64 core..."
+          curl -sSL https://github.com/MetaCubeX/mihomo/releases/download/v1.19.16/mihomo-linux-amd64-v1.19.16.gz -o mihomo.gz
+          gunzip mihomo.gz
+          chmod +x mihomo
+          
+          echo "[Setup] Starting Mihomo daemon with BDIX proxies on port 7890..."
+          ./mihomo -d . -f config.yaml > mihomo.log 2>&1 &
+          
+          # Wait up to 10s for proxy to listen
+          for i in {1..10}; do
+            if nc -z 127.0.0.1 7890 2>/dev/null; then
+              echo "[Setup] Mihomo proxy listening on 127.0.0.1:7890!"
+              break
+            fi
+            sleep 1
+          done
+          
+          # Verify connection through proxy to CircleFTP
+          echo "[Setup] Testing connectivity to CircleFTP..."
+          curl -sI --max-time 10 -x http://127.0.0.1:7890 http://new.circleftp.net:5000/api/categories || echo "Initial probe warning, continuing..."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Scraper & ML Vector Compiler
+        run: |
+          python crawler.py --outdir dist
+        env:
+          PYTHONUNBUFFERED: '1'
+
+      - name: Show Artifact Summary
+        run: |
+          ls -lh dist/
+          cat dist/manifest.json
+
+      - name: Publish to GitHub Releases (Tag: latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "CircleFTP Index & Embeddings (Automated Sync)"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/circleftp.db.zst
+            dist/circleftp.db.sha256
+            dist/manifest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
