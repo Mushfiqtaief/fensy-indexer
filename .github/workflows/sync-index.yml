@@ -58,7 +58,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          gh release upload latest dist/* --clobber || \
           gh release create latest dist/* \
             --title "CircleFTP Index and Embeddings (Automated Sync)" \
-            --notes "Automated daily sync of CircleFTP media database and 64-dim ML embeddings." \
-            --clobber
+            --notes "Automated daily sync of CircleFTP media database and 64-dim ML embeddings."
