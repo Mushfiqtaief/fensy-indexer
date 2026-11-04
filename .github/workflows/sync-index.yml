@@ -1,7 +1,7 @@
 name: "Sync BDIX Index"
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -43,7 +43,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Scraper & ML Vector Compiler
+      - name: "Execute Scraper and ML Vector Compiler"
         run: |
           python crawler.py --outdir dist
         env:
@@ -59,6 +59,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create latest dist/* \
-            --title "CircleFTP Index & Embeddings (Automated Sync)" \
+            --title "CircleFTP Index and Embeddings (Automated Sync)" \
             --notes "Automated daily sync of CircleFTP media database and 64-dim ML embeddings." \
             --clobber
