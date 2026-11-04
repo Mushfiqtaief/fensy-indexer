@@ -1,6 +1,6 @@
 name: "Sync BDIX Index"
 
-on:
+'on':
   workflow_dispatch:
   push:
     branches:
@@ -54,7 +54,7 @@ jobs:
           ls -lh dist/
           cat dist/manifest.json
 
-      - name: Publish to GitHub Releases (Tag: latest)
+      - name: "Publish to GitHub Releases"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
