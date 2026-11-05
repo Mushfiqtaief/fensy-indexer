@@ -7,6 +7,7 @@ a lightweight, compressed SQLite database for 0ms client mounting.
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -14,7 +15,9 @@ import sqlite3
 import hashlib
 import struct
 import argparse
-from typing import List, Dict, Any, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 import numpy as np
@@ -30,6 +33,13 @@ DIRECT_SOCKS_PROXIES = [
 ]
 
 BASE_URL = "http://new.circleftp.net:5000"
+
+PAGE_SIZE = 100
+PAGE_WORKERS = 8
+CATEGORY_WORKERS = 4
+PAGE_RETRIES = 3
+PAGE_TIMEOUT = 20
+SESSION_LOCAL = threading.local()
 
 
 def get_active_session() -> requests.Session:
@@ -52,7 +62,7 @@ def get_active_session() -> requests.Session:
             )
             if r.status_code == 200 and len(r.json()) > 0:
                 print(f"[Proxy] Connected successfully via Mihomo ({local_proxy})!")
-                session.proxies.update({"http": local_proxy, "https": local_proxy})
+                _configure_session(session, {"http": local_proxy, "https": local_proxy})
                 return session
         except Exception:
             pass
@@ -68,7 +78,7 @@ def get_active_session() -> requests.Session:
             )
             if r.status_code == 200 and len(r.json()) > 0:
                 print(f"[Proxy] Connected successfully via SOCKS5 ({socks_proxy})!")
-                session.proxies.update({"http": socks_proxy, "https": socks_proxy})
+                _configure_session(session, {"http": socks_proxy, "https": socks_proxy})
                 return session
         except Exception as e:
             print(f"[Proxy] {socks_proxy} unavailable: {e}")
@@ -86,13 +96,150 @@ def get_active_session() -> requests.Session:
     raise ConnectionError("Could not establish proxy connection to CircleFTP.")
 
 
+_PROXY_CONFIG: Dict[str, str] = {}
+
+
+def _configure_session(session: requests.Session, proxies: Dict[str, str]) -> None:
+    """Applies proxies plus a connection pool sized for parallel page fetches."""
+    global _PROXY_CONFIG
+    _PROXY_CONFIG = dict(proxies)
+    session.proxies.update(proxies)
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=PAGE_WORKERS * 2,
+        pool_maxsize=PAGE_WORKERS * 2,
+        max_retries=0,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+
+def thread_session() -> requests.Session:
+    """One pooled session per worker thread (requests sessions are not thread-safe)."""
+    session = getattr(SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FensyIndexer/2.0",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+        })
+        if _PROXY_CONFIG:
+            session.proxies.update(_PROXY_CONFIG)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=4, max_retries=0
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        SESSION_LOCAL.session = session
+    return session
+
+
+
+BLOCKED_CATEGORY_KEYWORDS = {
+    'software', 'softwares', 'game', 'games', 'pc games', 'pc game',
+    'console games', 'linux games', 'game mods',
+    'apk', 'android apps', 'android games', 'app', 'apps', 'application', 'applications',
+    'mobile apps', 'iphone apps',
+    'pdf', 'book', 'books', 'ebook', 'ebooks', 'magazine', 'magazines',
+    'comic', 'comics', 'tutorial', 'tutorials', 'operating system', 'os', 'windows os',
+    'tools', 'utilities', 'audiobook', 'audiobooks', 'firmware'
+}
+
+BLOCKED_CATEGORY_IDS = {'11', '12', '13', '14', '36'}
+
+BLOCKED_EXTENSIONS = (
+    '.apk', '.exe', '.pdf', '.iso', '.zip', '.rar', '.7z', '.dmg', '.pkg',
+    '.epub', '.mobi', '.msi', '.bin', '.tar', '.gz', '.cbr', '.cbz'
+)
+
+# Titles that are software/games/books without a file-extension hint, e.g.
+# "Circle Network Apk", "Smart Switch PC Setup Samsung", "ModelSim (PC)".
+BLOCKED_TITLE_KEYWORDS = (
+    'apk', 'apks', 'pc software', 'software', 'portable', 'repack', 'repacks',
+    'multiboot', 'keymaker', 'keygen', 'crack', 'cracked', 'activator',
+    'driver', 'drivers', 'setup', 'installer', 'toolkit',
+    'pc game', 'pc games', 'android app', 'android apps',
+    'android game', 'android games',
+    'windows os', 'windows 7', 'windows 8', 'windows 10', 'windows 11',
+    'macos', 'pcmover', 'pctrans', 'after effects', 'premiere pro',
+    'photoshop', 'illustrator', 'modelsim', 'matlab', 'autocad',
+    'easeus', 'probook', 'notebook pc', 'iso',
+)
+
+_BLOCKED_TITLE_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in BLOCKED_TITLE_KEYWORDS) + r')\b',
+    re.IGNORECASE,
+)
+_BLOCKED_PC_TAG_RE = re.compile(r'\(pc\)', re.IGNORECASE)
+
+
+def is_blocked_category(name: str) -> bool:
+    lower = (name or "").lower().strip()
+    if not lower:
+        return False
+    for kw in BLOCKED_CATEGORY_KEYWORDS:
+        if re.search(r'\b' + re.escape(kw) + r'\b', lower):
+            return True
+    return False
+
+
+def is_blocked_category_id(cat_id: Any) -> bool:
+    return str(cat_id) in BLOCKED_CATEGORY_IDS if cat_id is not None else False
+
+
+def is_blocked_media(title: str, synopsis: str = "") -> bool:
+    t = (title or "").lower()
+    s = (synopsis or "").lower()
+    for ext in BLOCKED_EXTENSIONS:
+        if t.endswith(ext) or f"{ext} " in t or f"{ext}]" in t or s.endswith(ext):
+            return True
+    if _BLOCKED_TITLE_RE.search(t) or _BLOCKED_PC_TAG_RE.search(t):
+        return True
+    return False
+
+
+
 def crawl_categories(session: requests.Session) -> List[Dict[str, Any]]:
     print("\n[Crawler] Fetching categories...")
     r = session.get(f"{BASE_URL}/api/categories", timeout=10)
     r.raise_for_status()
-    categories = r.json()
-    print(f"[Crawler] Found {len(categories)} root categories.")
+    raw_categories = r.json()
+    
+    categories = []
+    for cat in raw_categories:
+        name = cat.get("name", "")
+        if is_blocked_category(name):
+            continue
+        
+        filtered_sub = [
+            sub for sub in cat.get("subCategory", [])
+            if not is_blocked_category(sub.get("name", ""))
+        ]
+        cat["subCategory"] = filtered_sub
+        categories.append(cat)
+        
+    print(f"[Crawler] Found {len(categories)} root video categories (filtered non-video).")
     return categories
+
+
+def _fetch_page(cat_id: Any, page: int) -> Optional[Dict[str, Any]]:
+    url = f"{BASE_URL}/api/posts"
+    params = {
+        "categoryExact": cat_id,
+        "page": page,
+        "limit": PAGE_SIZE,
+        "order": "desc",
+    }
+    for attempt in range(PAGE_RETRIES):
+        try:
+            r = thread_session().get(url, params=params, timeout=PAGE_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            print(f"  [Warning] HTTP {r.status_code} on page {page}, retrying...")
+        except Exception as e:
+            print(f"\n  [Error] Failed page {page}: {e}. Retrying...")
+        time.sleep(0.5 * (attempt + 1))
+    return None
 
 
 def crawl_category_posts(
@@ -101,47 +248,36 @@ def crawl_category_posts(
     cat_name: str,
     max_pages: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    items = []
-    page = 1
-    total_pages = 1
-
     print(f"\n[Crawler] Crawling category [{cat_id}] '{cat_name}'...")
-    while page <= total_pages:
-        if max_pages and page > max_pages:
-            break
-        try:
-            url = f"{BASE_URL}/api/posts"
-            params = {
-                "categoryExact": cat_id,
-                "page": page,
-                "limit": 50,
-                "order": "desc",
+
+    first = _fetch_page(cat_id, 1)
+    if not first:
+        print(f"  -> Failed category '{cat_name}'.")
+        return []
+
+    items = list(first.get("posts") or [])
+    pagination = first.get("pagination") or {}
+    total_pages = int(pagination.get("pages", 1) or 1)
+    total_items = pagination.get("total", len(items))
+    if max_pages:
+        total_pages = min(total_pages, max_pages)
+
+    if total_pages > 1:
+        with ThreadPoolExecutor(max_workers=PAGE_WORKERS) as pool:
+            futures = {
+                pool.submit(_fetch_page, cat_id, p): p
+                for p in range(2, total_pages + 1)
             }
-            r = session.get(url, params=params, timeout=10)
-            if r.status_code != 200:
-                print(f"  [Warning] HTTP {r.status_code} on page {page}, retrying...")
-                time.sleep(1)
-                continue
+            for fut in as_completed(futures):
+                data = fut.result()
+                if data:
+                    items.extend(data.get("posts") or [])
 
-            data = r.json()
-            posts = data.get("posts", [])
-            if not posts:
-                break
-
-            items.extend(posts)
-            pagination = data.get("pagination", {})
-            total_pages = pagination.get("pages", 1)
-            total_items = pagination.get("total", len(items))
-
-            print(f"  -> Page {page}/{total_pages} ({len(items)}/{total_items} items)", end="\r")
-            page += 1
-            time.sleep(0.08)
-        except Exception as e:
-            print(f"\n  [Error] Failed page {page}: {e}. Retrying...")
-            time.sleep(1)
-
-    print(f"\n  -> Finished category '{cat_name}': {len(items)} total items.")
+    # Page order is lost when parallel; restore newest-first via id.
+    items.sort(key=lambda p: int(p.get("id") or 0), reverse=True)
+    print(f"\n  -> Finished category '{cat_name}': {len(items)}/{total_items} items across {total_pages} pages.")
     return items
+
 
 
 def compute_ml_embeddings(items: List[Dict[str, Any]], dim: int = 64) -> List[bytes]:
@@ -173,30 +309,35 @@ def compute_ml_embeddings(items: List[Dict[str, Any]], dim: int = 64) -> List[by
         ngram_range=(1, 2),
         sublinear_tf=True,
         stop_words="english",
+        dtype=np.float32,
     )
     X = tfidf.fit_transform(corpus)
 
-    # 2. Dimensionality reduction to 64 components
+    # 2. Dimensionality reduction to 64 components. Randomized SVD keeps this
+    #    near-linear instead of the O(n^2) exact path.
     actual_dim = min(dim, X.shape[1], len(items) - 1)
     if actual_dim < dim:
         actual_dim = max(2, actual_dim)
 
-    svd = TruncatedSVD(n_components=actual_dim, random_state=42)
-    X_reduced = svd.fit_transform(X)
+    svd = TruncatedSVD(
+        n_components=actual_dim,
+        random_state=42,
+        algorithm="randomized",
+        n_iter=5,
+    )
+    X_reduced = svd.fit_transform(X).astype(np.float32, copy=False)
 
+    # Pad with zeros if fewer than target dimensions
     if actual_dim < dim:
         padded = np.zeros((X_reduced.shape[0], dim), dtype=np.float32)
         padded[:, :actual_dim] = X_reduced
         X_reduced = padded
 
-    # 3. L2 Normalize
+    # 3. L2 Normalize (Cosine similarity becomes standard dot product)
     X_normalized = normalize(X_reduced, norm="l2")
 
     # 4. Pack into binary buffers (64 floats * 4 bytes = 256 bytes)
-    packed_blobs = []
-    for row in X_normalized:
-        blob = struct.pack(f"{dim}f", *row)
-        packed_blobs.append(blob)
+    packed_blobs = [row.tobytes() for row in X_normalized]
 
     print(f"[ML Compiler] Successfully compiled {len(packed_blobs)} vectors (256 bytes each).")
     return packed_blobs
@@ -301,6 +442,10 @@ def compile_sqlite_database(
     for idx, item in enumerate(items):
         item_id = str(item.get("id"))
         title = item.get("title", "") or ""
+        synopsis = item.get("metaData", "") or ""
+        if is_blocked_media(title, synopsis):
+            continue
+
         m_type = "series" if item.get("type") == "series" else "movie"
         image_sm = item.get("imageSm")
         image_lg = item.get("image")
@@ -310,6 +455,12 @@ def compile_sqlite_database(
         cats = item.get("categories", [])
         cat_id = str(cats[0].get("id")) if cats else "0"
         sub_cat_id = str(cats[1].get("id")) if len(cats) > 1 else None
+
+        if is_blocked_category_id(cat_id) or is_blocked_category_id(sub_cat_id):
+            continue
+        if any(is_blocked_category(c.get("name", "")) for c in cats if isinstance(c, dict)):
+            continue
+
         genres = ", ".join([c.get("name", "") for c in cats if isinstance(c, dict)])
 
         created_epoch = int(time.time())
@@ -349,6 +500,7 @@ def compile_sqlite_database(
             ),
         )
 
+        # FTS insert
         cur.execute(
             "INSERT INTO media_fts(rowid, title, synopsis, genres) VALUES (last_insert_rowid(), ?, ?, ?)",
             (title, str(item.get("metaData", "") or ""), genres),
@@ -445,17 +597,54 @@ def main():
     all_items = []
     seen_ids = set()
 
-    for cat in categories:
-        cat_id = cat.get("id")
-        cat_name = cat.get("name", "Unknown")
-        posts = crawl_category_posts(session, cat_id, cat_name, max_pages=args.max_pages_per_cat)
-        for p in posts:
-            pid = str(p.get("id"))
-            if pid not in seen_ids:
-                seen_ids.add(pid)
-                all_items.append(p)
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=CATEGORY_WORKERS) as pool:
+        futures = {
+            pool.submit(
+                crawl_category_posts,
+                session,
+                cat.get("id"),
+                cat.get("name", "Unknown"),
+                args.max_pages_per_cat,
+            ): cat
+            for cat in categories
+        }
+        for fut in as_completed(futures):
+            cat = futures[fut]
+            try:
+                posts = fut.result()
+            except Exception as e:
+                print(f"[Crawler] Category {cat.get('id')} failed: {e}")
+                continue
+            for p in posts:
+                pid = str(p.get("id"))
+                if pid not in seen_ids:
+                    seen_ids.add(pid)
+                    all_items.append(p)
 
-    print(f"\n[Summary] Total unique items collected: {len(all_items)}")
+    print(f"\n[Summary] Total unique items collected: {len(all_items)} in {time.time() - started:.1f}s")
+
+    # Drop non-video posts before embedding so software/APK rows never occupy
+    # vector space or enter the feed.
+    video_items = [
+        p for p in all_items
+        if not is_blocked_media(p.get("title", "") or "", p.get("metaData", "") or "")
+        and not any(
+            is_blocked_category(c.get("name", ""))
+            for c in (p.get("categories") or [])
+            if isinstance(c, dict)
+        )
+        and not any(
+            is_blocked_category_id(c.get("id"))
+            for c in (p.get("categories") or [])
+            if isinstance(c, dict)
+        )
+    ]
+    dropped = len(all_items) - len(video_items)
+    if dropped:
+        print(f"[Filter] Dropped {dropped} non-video posts.")
+    all_items = video_items
+
     if not all_items:
         print("[Error] No items scraped. Exiting.")
         sys.exit(1)
