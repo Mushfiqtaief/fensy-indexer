@@ -64,6 +64,27 @@ MAX_PAGES_PER_SOURCE = 30
 REQUEST_TIMEOUT = 20
 RETRY_STATUSES = {403, 406, 407, 429, 500, 502, 503, 504}
 
+# Search expansion: keyword seeds swept through search/v2 to reach the full
+# catalog (ranking lists only surface ~700 curated titles). Per-seed yields
+# measured live: 'a'=446, 'love'=451, 'k'=480, '2024'=412. 26 letters + digits
+# + common-word seeds reach the tens of thousands. Search caps at perPage=20
+# (30+ returns HTTP 400) and paginates until an empty page.
+SEARCH_SEEDS = [chr(c) for c in range(ord('a'), ord('z') + 1)] + [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    'the', 'love', 'king', 'star', 'man', 'girl', 'life', 'night', 'day',
+    'house', 'story', 'war', 'last', 'one', 'two', 'my', 'no', 'new', 'old',
+    'big', 'little', 'young', 'dead', 'dark', 'light', 'lost', 'secret',
+    'movie', 'film', 'hindi', 'movie hindi', 'south', 'bengali', 'punjabi',
+    'hollywood', 'bollywood', 'tamil', 'telugu', '2020', '2021', '2022',
+    '2023', '2024', '2025', '2026', 'game', 'mission', 'city', 'home',
+    'heart', 'fire', 'blood', 'gold', 'money', 'world', 'time', 'power',
+    'blue', 'black', 'red', 'white', 'green',
+]
+SEARCH_PAGE_SIZE = 20
+SEARCH_MAX_PAGES = 120
+SEARCH_WORKERS = 6
+SEARCH_PAGE_DELAY = 0.12
+
 _SESSION_LOCAL = threading.local()
 _host_lock = threading.Lock()
 _active_host_idx = 0
@@ -346,6 +367,64 @@ def crawl_subject_details(client: MovieBoxClient, subject_ids: List[str]) -> Dic
     return details
 
 
+def _extract_search_subjects(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    subjects: List[Dict[str, Any]] = []
+    results = payload.get("results") or payload.get("list")
+    if isinstance(results, list):
+        for group in results:
+            if isinstance(group, dict):
+                subjects.extend(s for s in (group.get("subjects") or []) if isinstance(s, dict))
+            elif isinstance(group, dict) is False and isinstance(group, list):
+                subjects.extend(s for s in group if isinstance(s, dict))
+    if not subjects and isinstance(payload.get("list"), list):
+        subjects.extend(s for s in payload["list"] if isinstance(s, dict))
+    return subjects
+
+
+def crawl_search_seed(client: MovieBoxClient, seed: str) -> List[Dict[str, Any]]:
+    collected: List[Dict[str, Any]] = []
+    for page in range(1, SEARCH_MAX_PAGES + 1):
+        try:
+            data = client.post(
+                f"{BFF}/subject-api/search/v2",
+                json.dumps({"keyword": seed, "page": page, "perPage": SEARCH_PAGE_SIZE, "subjectType": 0}),
+            )
+        except Exception:
+            break
+        subjects = _extract_search_subjects(data)
+        if not subjects:
+            break
+        collected.extend(subjects)
+        time.sleep(SEARCH_PAGE_DELAY)
+    return collected
+
+
+def crawl_search_sweep(client: MovieBoxClient) -> Dict[str, Dict[str, Any]]:
+    """Sweep keyword seeds through search/v2; dedup by subjectId."""
+    by_id: Dict[str, Dict[str, Any]] = {}
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as pool:
+        futures = {pool.submit(crawl_search_seed, client, seed): seed for seed in SEARCH_SEEDS}
+        done = 0
+        for fut in as_completed(futures):
+            seed = futures[fut]
+            try:
+                subjects = fut.result()
+            except Exception as e:
+                print(f"[Search] seed '{seed}' failed: {e}")
+                subjects = []
+            new = 0
+            for s in subjects:
+                sid = str(s.get("subjectId") or "")
+                if sid and sid not in by_id:
+                    by_id[sid] = s
+                    new += 1
+            done += 1
+            print(f"[Search] '{seed}': {len(subjects)} raw, +{new} new (unique {len(by_id)}) [{done}/{len(SEARCH_SEEDS)}]")
+    print(f"[Search] sweep complete: {len(by_id)} unique subjects in {time.time() - started:.0f}s")
+    return by_id
+
+
 # ---------------------------------------------------------------------------
 # ML embeddings + SQLite (same schema as the CircleFTP indexer)
 # ---------------------------------------------------------------------------
@@ -565,6 +644,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fensy MovieBox Indexer & ML Compiler")
     parser.add_argument("--outdir", default="dist")
     parser.add_argument("--skip-details", action="store_true", help="Skip subject detail fetch (faster, thinner corpus)")
+    parser.add_argument("--skip-search", action="store_true", help="Skip search-seed sweep (curated ranking+homepage only)")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -600,8 +680,20 @@ def main() -> None:
     except Exception as e:
         print(f"[Crawler] homepage crawl failed: {e}")
 
+    ranking_count = len(raw_by_id)
+    print(f"\n[Summary] Curated subjects (ranking + homepage): {ranking_count}")
+
+    # 1b. Search-seed sweep: expands past the curated ~700 to the full catalog.
+    if not args.skip_search:
+        try:
+            for sid, s in crawl_search_sweep(client).items():
+                if sid not in raw_by_id:
+                    raw_by_id[sid] = s
+        except Exception as e:
+            print(f"[Crawler] search sweep failed (continuing with curated): {e}")
+    print(f"[Summary] Unique subjects after sweep: {len(raw_by_id)}")
+
     raw_items = list(raw_by_id.values())
-    print(f"\n[Summary] Unique subjects: {len(raw_items)}")
 
     # 2. Details for embedding corpus (descriptions are empty on cards).
     details: Dict[str, Dict[str, Any]] = {}
