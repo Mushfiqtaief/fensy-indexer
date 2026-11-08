@@ -43,22 +43,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: "Execute Scraper and ML Vector Compiler"
+      - name: "Execute CircleFTP Scraper and ML Vector Compiler"
         run: |
           python crawler.py --outdir dist
+        env:
+          PYTHONUNBUFFERED: '1'
+
+      - name: "Execute MovieBox Scraper and ML Vector Compiler"
+        run: |
+          python moviebox_indexer.py --outdir dist
         env:
           PYTHONUNBUFFERED: '1'
 
       - name: Show Artifact Summary
         run: |
           ls -lh dist/
-          cat dist/manifest.json
+          cat dist/manifest.json || true
 
       - name: "Publish to GitHub Releases"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload latest dist/* --clobber || \
+          # The release always exists (created once); retry upload up to 5 times
+          # to ride out transient GitHub API 5xx errors on asset replacement.
+          for i in 1 2 3 4 5; do
+            if gh release upload latest dist/* --clobber; then
+              echo "[Publish] Assets uploaded (attempt $i)."
+              exit 0
+            fi
+            echo "[Publish] Upload attempt $i failed, retrying in 15s..."
+            sleep 15
+          done
+          echo "[Publish] All retry attempts exhausted. Creating release as last resort."
           gh release create latest dist/* \
-            --title "CircleFTP Index and Embeddings (Automated Sync)" \
-            --notes "Automated daily sync of CircleFTP media database and 64-dim ML embeddings."
+            --title "Fensy Catalogs & Embeddings (Automated Sync)" \
+            --notes "Automated 6-hour sync of CircleFTP and MovieBox media databases with 64-dim ML embeddings."
