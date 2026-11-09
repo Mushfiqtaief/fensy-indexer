@@ -18,12 +18,9 @@ import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
-
 import requests
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import TruncatedSVD
-from sklearn.preprocessing import normalize
+from hash_embeddings import compute_embedding_bytes
+from imdb_matcher import enrich_with_imdb
 
 # Fallback proxies if local Mihomo daemon is not running
 DIRECT_SOCKS_PROXIES = [
@@ -283,61 +280,26 @@ def crawl_category_posts(
 def compute_ml_embeddings(items: List[Dict[str, Any]], dim: int = 64) -> List[bytes]:
     """
     Computes a 64-dimensional semantic embedding for each media item using
-    TF-IDF feature extraction + TruncatedSVD dimensionality reduction.
-    The resulting vector is L2-normalized so cosine similarity is equal to dot product.
-    Packed into binary BLOB (64 * 4 = 256 bytes).
+    Rust-aligned MD5 feature hashing. The vector is L2-normalized so cosine
+    similarity is equal to dot product. Packed into binary BLOB (256 bytes).
     """
-    print(f"\n[ML Compiler] Generating {dim}-dimensional semantic embeddings for {len(items)} items...")
+    print(f"\n[ML Compiler] Generating {dim}-dimensional universal feature-hash embeddings for {len(items)} items...")
 
-    corpus = []
+    packed_blobs = []
     for item in items:
         title = item.get("title", "") or ""
         synopsis = item.get("metaData", "") or ""
-        tags = item.get("tags", "") or ""
-        quality = item.get("quality", "") or ""
-        year = str(item.get("year", "")) or ""
-
         genres_list = [c.get("name", "") for c in item.get("categories", []) if isinstance(c, dict)]
-        genres = " ".join(genres_list)
+        cat_genres = ", ".join(genres_list) if genres_list else ""
+        imdb_genres = item.get("imdb_genres") or ""
+        genres = f"{imdb_genres}, {cat_genres}".strip(", ") if (imdb_genres or cat_genres) else None
 
-        text = f"{title} {title} {genres} {genres} {tags} {year} {quality} {synopsis}"
-        corpus.append(text)
-
-    # 1. TF-IDF representation
-    tfidf = TfidfVectorizer(
-        max_features=12000,
-        ngram_range=(1, 2),
-        sublinear_tf=True,
-        stop_words="english",
-        dtype=np.float32,
-    )
-    X = tfidf.fit_transform(corpus)
-
-    # 2. Dimensionality reduction to 64 components. Randomized SVD keeps this
-    #    near-linear instead of the O(n^2) exact path.
-    actual_dim = min(dim, X.shape[1], len(items) - 1)
-    if actual_dim < dim:
-        actual_dim = max(2, actual_dim)
-
-    svd = TruncatedSVD(
-        n_components=actual_dim,
-        random_state=42,
-        algorithm="randomized",
-        n_iter=5,
-    )
-    X_reduced = svd.fit_transform(X).astype(np.float32, copy=False)
-
-    # Pad with zeros if fewer than target dimensions
-    if actual_dim < dim:
-        padded = np.zeros((X_reduced.shape[0], dim), dtype=np.float32)
-        padded[:, :actual_dim] = X_reduced
-        X_reduced = padded
-
-    # 3. L2 Normalize (Cosine similarity becomes standard dot product)
-    X_normalized = normalize(X_reduced, norm="l2")
-
-    # 4. Pack into binary buffers (64 floats * 4 bytes = 256 bytes)
-    packed_blobs = [row.tobytes() for row in X_normalized]
+        blob = compute_embedding_bytes(
+            title=title,
+            synopsis=synopsis if synopsis else None,
+            genres=genres,
+        )
+        packed_blobs.append(blob)
 
     print(f"[ML Compiler] Successfully compiled {len(packed_blobs)} vectors (256 bytes each).")
     return packed_blobs
@@ -370,6 +332,7 @@ def compile_sqlite_database(
     cur.execute("INSERT INTO plugin_info VALUES ('name', 'Circle FTP');")
     cur.execute(f"INSERT INTO plugin_info VALUES ('compiled_at', '{int(time.time())}');")
     cur.execute(f"INSERT INTO plugin_info VALUES ('total_items', '{len(items)}');")
+    cur.execute("INSERT INTO plugin_info VALUES ('vector_format', 'md5_64');")
 
     # 2. Categories
     cur.execute("""
@@ -391,7 +354,6 @@ def compile_sqlite_database(
                 (str(sub.get("id")), sub.get("name", ""), str(cat.get("id")), 0),
             )
 
-    # 3. Media Items with Embedding BLOB
     cur.execute("""
         CREATE TABLE media_items (
             id TEXT PRIMARY KEY,
@@ -409,7 +371,8 @@ def compile_sqlite_database(
             genres TEXT,
             created_at INTEGER NOT NULL,
             extra_json TEXT,
-            embedding BLOB NOT NULL
+            embedding BLOB NOT NULL,
+            imdb_id TEXT
         );
     """)
 
@@ -461,7 +424,9 @@ def compile_sqlite_database(
         if any(is_blocked_category(c.get("name", "")) for c in cats if isinstance(c, dict)):
             continue
 
-        genres = ", ".join([c.get("name", "") for c in cats if isinstance(c, dict)])
+        cat_genres = ", ".join([c.get("name", "") for c in cats if isinstance(c, dict)])
+        imdb_genres = item.get("imdb_genres") or ""
+        genres = f"{imdb_genres}, {cat_genres}".strip(", ")
 
         created_epoch = int(time.time())
         created_str = item.get("createdAt")
@@ -477,8 +442,8 @@ def compile_sqlite_database(
             INSERT OR REPLACE INTO media_items (
                 id, title, type, category_id, sub_category_id,
                 poster_url, banner_url, year, quality, duration_text,
-                synopsis, rating, genres, created_at, extra_json, embedding
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                synopsis, rating, genres, created_at, extra_json, embedding, imdb_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
@@ -497,6 +462,7 @@ def compile_sqlite_database(
                 created_epoch,
                 json.dumps({"tags": item.get("tags")}),
                 embeddings[idx],
+                item.get("imdb_id"),
             ),
         )
 
@@ -649,7 +615,21 @@ def main():
         print("[Error] No items scraped. Exiting.")
         sys.exit(1)
 
-    # 2. ML Semantic Vectors
+    def _apply_imdb(item: Dict[str, Any], imdb_id: str, genres: Optional[str], year: Optional[int]) -> None:
+        item["imdb_id"] = imdb_id
+        if genres:
+            item["imdb_genres"] = genres
+        if year and not item.get("year"):
+            item["year"] = str(year)
+
+    enrich_with_imdb(
+        all_items,
+        get_title=lambda x: x.get("title", "") or "",
+        get_year=lambda x: str(x.get("year") or ""),
+        is_series_fn=lambda x: x.get("type") == "series",
+        on_match=_apply_imdb,
+    )
+
     embeddings = compute_ml_embeddings(all_items, dim=64)
 
     # 3. SQLite Database

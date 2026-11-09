@@ -25,12 +25,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
-
-import numpy as np
 import requests
-from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize
+from hash_embeddings import compute_embedding_bytes
+from imdb_matcher import enrich_with_imdb
 
 # ---------------------------------------------------------------------------
 # Signing (transcribed from mesamirh/MovieBox-Tui crypto.rs, MIT/Apache)
@@ -430,26 +427,19 @@ def crawl_search_sweep(client: MovieBoxClient) -> Dict[str, Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def compute_ml_embeddings(corpus: List[str], dim: int = 64) -> List[bytes]:
-    print(f"\n[ML Compiler] Generating {dim}-dim embeddings for {len(corpus)} items...")
-    tfidf = TfidfVectorizer(
-        max_features=12000,
-        ngram_range=(1, 2),
-        sublinear_tf=True,
-        stop_words="english",
-        dtype=np.float32,
-    )
-    X = tfidf.fit_transform(corpus)
-    actual_dim = max(2, min(dim, X.shape[1], len(corpus) - 1))
-    svd = TruncatedSVD(n_components=actual_dim, random_state=42, algorithm="randomized", n_iter=5)
-    reduced = svd.fit_transform(X).astype(np.float32, copy=False)
-    if actual_dim < dim:
-        padded = np.zeros((reduced.shape[0], dim), dtype=np.float32)
-        padded[:, :actual_dim] = reduced
-        reduced = padded
-    normalized = normalize(reduced, norm="l2")
-    print(f"[ML Compiler] Compiled {len(normalized)} vectors (256 bytes each).")
-    return [row.tobytes() for row in normalized]
+def compute_ml_embeddings(rows: List[Dict[str, Any]], dim: int = 64) -> List[bytes]:
+    print(f"\n[ML Compiler] Generating {dim}-dim universal feature-hash embeddings for {len(rows)} items...")
+    packed_blobs = [
+        compute_embedding_bytes(
+            title=r.get("title", "") or "",
+            synopsis=r.get("synopsis", "") or None,
+            genres=r.get("genres", "") or None,
+            category=r.get("category_id", "") or None,
+        )
+        for r in rows
+    ]
+    print(f"[ML Compiler] Compiled {len(packed_blobs)} vectors (256 bytes each).")
+    return packed_blobs
 
 
 def compile_sqlite_database(
@@ -474,6 +464,7 @@ def compile_sqlite_database(
     cur.execute("INSERT INTO plugin_info VALUES ('name', 'MovieBox');")
     cur.execute(f"INSERT INTO plugin_info VALUES ('compiled_at', '{int(time.time())}');")
     cur.execute(f"INSERT INTO plugin_info VALUES ('total_items', '{len(rows)}');")
+    cur.execute("INSERT INTO plugin_info VALUES ('vector_format', 'md5_64');")
 
     cur.execute("""
         CREATE TABLE categories (
@@ -506,7 +497,8 @@ def compile_sqlite_database(
             genres TEXT,
             created_at INTEGER NOT NULL,
             extra_json TEXT,
-            embedding BLOB NOT NULL
+            embedding BLOB NOT NULL,
+            imdb_id TEXT
         );
     """)
 
@@ -526,8 +518,8 @@ def compile_sqlite_database(
             INSERT OR REPLACE INTO media_items (
                 id, title, type, category_id, sub_category_id,
                 poster_url, banner_url, year, quality, duration_text,
-                synopsis, rating, genres, created_at, extra_json, embedding
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                synopsis, rating, genres, created_at, extra_json, embedding, imdb_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row["id"],
@@ -546,6 +538,7 @@ def compile_sqlite_database(
                 now,
                 json.dumps({"viewers": row.get("viewers"), "country": row.get("country")}),
                 embeddings[idx],
+                row.get("imdb_id"),
             ),
         )
         cur.execute(
@@ -709,12 +702,22 @@ def main() -> None:
         sys.exit(1)
     print(f"[Summary] Rows after filters: {len(rows)}")
 
-    # 3. ML vectors over title + genres + description.
-    corpus = [
-        f"{r['title']} {r['title']} {r['genres']} {r['genres']} {r['synopsis']} {r['year']}"
-        for r in rows
-    ]
-    embeddings = compute_ml_embeddings(corpus, dim=64)
+    def _apply_imdb(row: Dict[str, Any], imdb_id: str, genres: Optional[str], year: Optional[int]) -> None:
+        row["imdb_id"] = imdb_id
+        if genres and not row.get("genres"):
+            row["genres"] = genres
+        if year and not row.get("year"):
+            row["year"] = str(year)
+
+    enrich_with_imdb(
+        rows,
+        get_title=lambda r: r.get("title", "") or "",
+        get_year=lambda r: r.get("year"),
+        is_series_fn=lambda r: r.get("type") == "series",
+        on_match=_apply_imdb,
+    )
+
+    embeddings = compute_ml_embeddings(rows, dim=64)
 
     # 4. SQLite + compression + checksum.
     db_path = os.path.join(args.outdir, "moviebox.db")
